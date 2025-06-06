@@ -1,0 +1,424 @@
+--------------------------------------------
+---- RECEBIMENTOS_LOJAS - VALIDAÇÃO FINAL --
+--------------------------------------------
+DECLARE @RECEBIMENTO_LOJA                        NUMERIC(15)  = :RECEBIMENTO_LOJA
+DECLARE @EMPRESA                                 NUMERIC(15)  = :EMPRESA
+DECLARE @PROCESSAR                               VARCHAR(01)  = :PROCESSAR
+DECLARE @RECEBIMENTO_SEM_BOLETO                  VARCHAR(01)  = :RECEBIMENTO_SEM_BOLETO
+DECLARE @BATIMENTO_FINANCEIRO_NFE                VARCHAR(01)  = ( SELECT A.BATIMENTO_FINANCEIRO_NFE FROM EMPRESAS_USUARIAS A WITH(NOLOCK) WHERE A.EMPRESA_USUARIA = @EMPRESA )
+DECLARE @RECEBIMENTO_BOLETO                      NUMERIC(15)  = ( SELECT COUNT(*) FROM RECEBIMENTOS_LOJAS_BOLETOS A WHERE A.RECEBIMENTO_LOJA = @RECEBIMENTO_LOJA )
+DECLARE @MENSAGEM                                VARCHAR(MAX)
+DECLARE @DB                                      VARCHAR(100) = DB_NAME()
+DECLARE @OBRIGATORIO_OCORRENCIA_RECEBIMENTO_LOJA VARCHAR(1)
+DECLARE @ID                                      VARCHAR(47)  = :ID
+DECLARE @ID_TRANSF                               NUMERIC(15)
+DECLARE @USUARIO                                 NUMERIC(15)  = :USUARIO_LOGADO
+DECLARE @FORCAR_VINCULO_PEDIDO_RECEBIMENTO       VARCHAR(1)
+DECLARE @BLOQUEAR_RECEBIMENTO_SEM_BOLETO         VARCHAR(1)
+
+   SELECT @FORCAR_VINCULO_PEDIDO_RECEBIMENTO = ISNULL(A.PARAMETRO, 'N')
+     FROM EMPRESAS_PARAMETROS A WITH(NOLOCK)
+    WHERE A.TAG = 'FORCAR_VINCULO_PEDIDO_RECEBIMENTO'
+      AND A.PARAMETRO = 'S'
+	  
+   SELECT @BLOQUEAR_RECEBIMENTO_SEM_BOLETO = ISNULL(A.BLOQUEAR_RECEBIMENTO_SEM_BOLETO, 'N')
+     FROM USUARIOS A
+	WHERE A.USUARIO = @USUARIO
+	
+   IF @PROCESSAR = 'S' AND @BLOQUEAR_RECEBIMENTO_SEM_BOLETO = 'S'
+   BEGIN
+        RAISERROR('Não é permitido encerrar o Recebimento Loja sem Boletos!', 16, 1)
+		RETURN
+   END
+   
+   --GEMADA 27/04/2023--
+   --ALTEROU PARA SER POR UNION A VALIDAÇÃO, IGUAL O PBS--
+   IF OBJECT_ID('TEMPDB..#PEDIDOS_MMC') IS NOT NULL DROP TABLE #PEDIDOS_MMC
+   
+   CREATE
+    TABLE #PEDIDOS_MMC
+	    ( REGISTRO_NFE  NUMERIC(15)
+        , ID            VARCHAR(47)
+        , XPED_NFE_INF  VARCHAR(60)
+        , XPED_NFE_PROD VARCHAR(60)
+		)
+   
+   INSERT
+     INTO #PEDIDOS_MMC
+	    ( REGISTRO_NFE
+        , ID
+        , XPED_NFE_INF
+        , XPED_NFE_PROD
+		)
+   SELECT A.REGISTRO_NFE AS REGISTRO_NFE
+        , A.ID           AS ID
+        , MAX(B.XPED)    AS XPED_NFE_INF
+        , MAX(C.XPED)    AS XPED_NFE_PROD
+     FROM ( SELECT A.RECEBIMENTO_LOJA AS RECEBIMENTO_LOJA
+                 , A.ID               AS ID
+              FROM RECEBIMENTOS_LOJAS A WITH(NOLOCK)
+             WHERE A.RECEBIMENTO_LOJA = @RECEBIMENTO_LOJA
+            
+			UNION ALL
+            
+            SELECT Z.RECEBIMENTO_LOJA AS RECEBIMENTO_LOJA
+                 , A.ID_COMPLEMENTAR  AS ID
+              FROM RECEBIMENTOS_LOJAS     Z WITH(NOLOCK)
+              JOIN RECEBIMENTOS_LOJAS_NFE A WITH(NOLOCK) ON A.RECEBIMENTO_LOJA = Z.RECEBIMENTO_LOJA
+             WHERE Z.RECEBIMENTO_LOJA = @RECEBIMENTO_LOJA
+          ) Z
+     JOIN NFE_IDE  A WITH(NOLOCK) ON A.ID           = Z.ID
+LEFT JOIN NFE_INF  B WITH(NOLOCK) ON B.REGISTRO_NFE = A.REGISTRO_NFE
+LEFT JOIN NFE_PROD C WITH(NOLOCK) ON C.REGISTRO_NFE = A.REGISTRO_NFE
+    GROUP BY A.REGISTRO_NFE
+           , A.ID
+   
+   UPDATE #PEDIDOS_MMC
+      SET XPED_NFE_INF  = DBO.NUMERICO_NULL(XPED_NFE_INF)
+         ,XPED_NFE_PROD = DBO.NUMERICO_NULL(XPED_NFE_PROD)
+
+   ------------------------------------------
+   -- DIVERGENCIAS DE NOTA COM CONFERENCIA --
+   ------------------------------------------
+   IF OBJECT_ID('TEMPDB..#TEMP_RECEBIMENTOS_DIVERGENCIAS') IS NOT NULL DROP TABLE #TEMP_RECEBIMENTOS_DIVERGENCIAS
+   
+   CREATE
+    TABLE #TEMP_RECEBIMENTOS_DIVERGENCIAS
+        ( RECEBIMENTO_LOJA NUMERIC(15)  
+        , PRODUTO          NUMERIC(15)  
+        , QUANTIDADE       NUMERIC(15,2)
+        )
+   
+   SELECT @OBRIGATORIO_OCORRENCIA_RECEBIMENTO_LOJA = ISNULL(B.PARAMETRO, 'N')
+     FROM RECEBIMENTOS_LOJAS  A WITH(NOLOCK)
+     JOIN EMPRESAS_PARAMETROS B WITH(NOLOCK) ON B.EMPRESA_USUARIA = A.EMPRESA  
+    WHERE A.RECEBIMENTO_LOJA = @RECEBIMENTO_LOJA
+      AND B.TAG       = 'OBRIGATORIO_OCORRENCIA_RECEBIMENTO_LOJA'
+      AND B.PARAMETRO = 'S'
+      AND A.PROCESSAR = 'S'
+      
+   IF @OBRIGATORIO_OCORRENCIA_RECEBIMENTO_LOJA = 'S'
+   BEGIN
+
+        IF OBJECT_ID('TEMPDB..#TEMP_RECEBIMENTOS_NOTAS') IS NOT NULL DROP TABLE #TEMP_RECEBIMENTOS_NOTAS
+
+        CREATE
+         TABLE #TEMP_RECEBIMENTOS_NOTAS
+             ( RECEBIMENTO_LOJA NUMERIC(15)
+             , PRODUTO          NUMERIC(15)
+             , QUANTIDADE       NUMERIC(15,2)
+             )
+        
+        INSERT
+          INTO #TEMP_RECEBIMENTOS_NOTAS
+             ( RECEBIMENTO_LOJA
+             , PRODUTO
+             , QUANTIDADE
+             )
+        SELECT A.RECEBIMENTO_LOJA
+             , C.PRODUTO
+             , SUM(C.QCOM) AS QUANTIDADE
+          FROM RECEBIMENTOS_LOJAS     A WITH(NOLOCK)
+          JOIN NFE_IDE                B WITH(NOLOCK) ON B.ID           = A.ID
+          JOIN NFE_PROD               C WITH(NOLOCK) ON C.REGISTRO_NFE = B.REGISTRO_NFE
+         WHERE A.RECEBIMENTO_LOJA = @RECEBIMENTO_LOJA
+         GROUP BY A.RECEBIMENTO_LOJA
+                , C.PRODUTO
+        
+        UNION ALL
+        
+        SELECT A.RECEBIMENTO_LOJA
+             , D.PRODUTO
+             , SUM(D.QCOM) AS QUANTIDADE
+          FROM RECEBIMENTOS_LOJAS     A WITH(NOLOCK)
+          JOIN RECEBIMENTOS_LOJAS_NFE B WITH(NOLOCK) ON B.RECEBIMENTO_LOJA = A.RECEBIMENTO_LOJA
+          JOIN NFE_IDE                C WITH(NOLOCK) ON C.ID               = B.ID_COMPLEMENTAR
+          JOIN NFE_PROD               D WITH(NOLOCK) ON D.REGISTRO_NFE     = C.REGISTRO_NFE
+         WHERE A.RECEBIMENTO_LOJA = @RECEBIMENTO_LOJA
+         GROUP BY A.RECEBIMENTO_LOJA
+                , D.PRODUTO
+        
+        IF OBJECT_ID('TEMPDB..#TEMP_RECEBIMENTOS_LOJAS') IS NOT NULL DROP TABLE #TEMP_RECEBIMENTOS_LOJAS
+        
+        CREATE
+         TABLE #TEMP_RECEBIMENTOS_LOJAS
+              ( RECEBIMENTO_LOJA NUMERIC(15)
+              , PRODUTO          NUMERIC(15)
+              , QUANTIDADE       NUMERIC(15,2)
+              )
+        
+        INSERT
+          INTO #TEMP_RECEBIMENTOS_LOJAS
+             ( RECEBIMENTO_LOJA
+             , PRODUTO
+             , QUANTIDADE
+             )
+        
+        SELECT A.RECEBIMENTO_LOJA
+             , B.PRODUTO
+             , SUM(B.QUANTIDADE_TOTAL) AS QUANTIDADE
+          FROM RECEBIMENTOS_LOJAS              A WITH(NOLOCK)
+          JOIN RECEBIMENTOS_LOJAS_CONFERENCIAS B WITH(NOLOCK) ON B.RECEBIMENTO_LOJA = A.RECEBIMENTO_LOJA
+         WHERE A.RECEBIMENTO_LOJA = @RECEBIMENTO_LOJA
+         GROUP BY A.RECEBIMENTO_LOJA
+                , B.PRODUTO
+
+     
+        INSERT
+          INTO #TEMP_RECEBIMENTOS_DIVERGENCIAS
+             ( RECEBIMENTO_LOJA
+             , PRODUTO
+             , QUANTIDADE
+             ) 
+
+        SELECT CASE WHEN A.QUANTIDADE - B.QUANTIDADE - ISNULL(C.QUANTIDADE, 0) > 0
+                    THEN A.RECEBIMENTO_LOJA
+                    ELSE NULL
+               END AS RECEBIMENTO_LOJA
+             , CASE WHEN A.QUANTIDADE - B.QUANTIDADE - ISNULL(C.QUANTIDADE, 0) > 0
+                    THEN A.PRODUTO
+                    ELSE NULL
+               END AS PRODUTO
+             , CASE WHEN A.QUANTIDADE - B.QUANTIDADE - ISNULL(C.QUANTIDADE, 0) > 0
+                    THEN A.QUANTIDADE - B.QUANTIDADE
+                    ELSE NULL
+               END AS QUANTIDADE
+          FROM #TEMP_RECEBIMENTOS_NOTAS        A WITH(NOLOCK)
+          JOIN #TEMP_RECEBIMENTOS_LOJAS        B WITH(NOLOCK) ON B.RECEBIMENTO_LOJA = A.RECEBIMENTO_LOJA
+                                                             AND B.PRODUTO          = A.PRODUTO
+     LEFT JOIN RECEBIMENTOS_LOJAS_DIVERGENCIAS C WITH(NOLOCK) ON C.RECEBIMENTO_LOJA = A.RECEBIMENTO_LOJA
+                                                             AND C.PRODUTO          = A.PRODUTO
+         WHERE A.RECEBIMENTO_LOJA = @RECEBIMENTO_LOJA
+           AND A.RECEBIMENTO_LOJA IS NOT NULL
+           AND B.RECEBIMENTO_LOJA IS NOT NULL
+
+   END
+   
+   --GEMADA 27/04/2023--
+   --VALIDA SE O CENTRAL JÁ ESTÁ FINALIZADO--
+   SELECT TOP 1 CONCAT( 'Não é possível Finalizar um Recebimento de Loja quando o Central já foi processado.', CHAR(13)
+                      , 'Recebimento Central: ', B.RECEBIMENTO_MERCADORIA )
+     FROM RECEBIMENTOS_LOJAS A WITH(NOLOCK)
+     JOIN RECEBIMENTOS_MERCADORIAS B WITH(NOLOCK) ON B.RECEBIMENTO_MERCADORIA = A.RECEBIMENTO_MERCADORIA
+    WHERE A.RECEBIMENTO_LOJA = @RECEBIMENTO_LOJA
+      AND B.PROCESSAR = 'S'
+   
+   UNION ALL
+   
+   
+   SELECT TOP 1 CONCAT( 'A NF-e indicada não foi importada do SEFAZ ou existem produtos pendentes de cadastramento na central.', CHAR(13)
+                      , 'Chave NF-e: ', A.ID )
+     FROM ( SELECT A.RECEBIMENTO_LOJA AS RECEBIMENTO_LOJA
+                 , A.ID               AS ID
+              FROM RECEBIMENTOS_LOJAS A WITH(NOLOCK)
+         LEFT JOIN NFE_IDE            B WITH(NOLOCK) ON B.ID = A.ID
+             WHERE A.RECEBIMENTO_LOJA = @RECEBIMENTO_LOJA
+               AND B.REGISTRO_NFE IS NULL
+    
+            UNION ALL
+    
+            SELECT Z.RECEBIMENTO_LOJA AS RECEBIMENTO_LOJA
+                 , A.ID_COMPLEMENTAR  AS ID
+              FROM RECEBIMENTOS_LOJAS     Z WITH(NOLOCK)
+              JOIN RECEBIMENTOS_LOJAS_NFE A WITH(NOLOCK) ON A.RECEBIMENTO_LOJA = Z.RECEBIMENTO_LOJA
+         LEFT JOIN NFE_IDE                B WITH(NOLOCK) ON B.ID = A.ID_COMPLEMENTAR
+             WHERE Z.RECEBIMENTO_LOJA = @RECEBIMENTO_LOJA
+               AND B.REGISTRO_NFE IS NULL
+          ) A 
+
+   UNION ALL
+
+   SELECT TOP 1 CONCAT( 'A NF-e indicada é referente a um Pedido do MMC. Favor lançar os Pedidos utilizando o botão facilitador de Gerar Pedidos.'
+                      , CHAR(13), 'Chave NF-e: ', A.ID
+                      , CHAR(13), 'Pedido de Compra: ', B.PEDIDO_COMPRA
+                      , CHAR(13), 'Pedido MMC: ', B.PEDIDO_XML )
+     FROM #PEDIDOS_MMC               A WITH(NOLOCK)
+     JOIN PEDIDOS_COMPRAS            B WITH(NOLOCK) ON B.PEDIDO_XML       = ISNULL(A.XPED_NFE_INF, A.XPED_NFE_PROD)
+LEFT JOIN RECEBIMENTOS_LOJAS_PEDIDOS C WITH(NOLOCK) ON C.RECEBIMENTO_LOJA = @RECEBIMENTO_LOJA
+                                                   AND C.PEDIDO_COMPRA    = B.PEDIDO_COMPRA
+    WHERE C.RECEBIMENTO_LOJA_PEDIDO IS NULL 
+   
+   UNION ALL
+   
+   SELECT CONCAT('Registro : ', @RECEBIMENTO_LOJA, ' - Não marcado como recebimento sem boleto! ')
+    WHERE (@RECEBIMENTO_BOLETO = 0 AND @RECEBIMENTO_SEM_BOLETO <> 'S')
+   
+   UNION ALL
+
+   SELECT TOP 1 'É obrigatório informar os boletos para essa Empresa. Favor lançar os Boletos utilizando o botão facilitador de Gerar Boletos.'
+     FROM RECEBIMENTOS_LOJAS         A WITH(NOLOCK)
+LEFT JOIN RECEBIMENTOS_LOJAS_BOLETOS B WITH(NOLOCK) ON B.RECEBIMENTO_LOJA = A.RECEBIMENTO_LOJA
+    WHERE A.RECEBIMENTO_LOJA = @RECEBIMENTO_LOJA
+      AND B.RECEBIMENTO_LOJA IS NULL 
+      AND (ISNULL(@RECEBIMENTO_SEM_BOLETO, 'N') = 'N' AND ISNULL(@BATIMENTO_FINANCEIRO_NFE, 'N') = 'S' )
+   
+   UNION ALL
+   ---------------------------------------------------
+   -- TEM BOLETO LANÇADO MAS NÃO TEM CONTAS A PAGAR --
+   ---------------------------------------------------
+   SELECT TOP 1 'Existem boletos lançados, portanto é obrigatório lançar o Contas a Pagar. Favor lançar os Titulos utilizando o botão facilitador de Gerar Contas a Pagar.'
+     FROM RECEBIMENTOS_LOJAS               A WITH(NOLOCK)
+     JOIN RECEBIMENTOS_LOJAS_BOLETOS       B WITH(NOLOCK) ON B.RECEBIMENTO_LOJA = A.RECEBIMENTO_LOJA
+LEFT JOIN RECEBIMENTOS_LOJAS_TITULOS_PAGAR C WITH(NOLOCK) ON C.RECEBIMENTO_LOJA = A.RECEBIMENTO_LOJA
+    WHERE A.RECEBIMENTO_LOJA = @RECEBIMENTO_LOJA
+      AND C.RECEBIMENTO_LOJA IS NULL 
+   
+   UNION ALL
+
+   -------------------------------------------------------------------------
+   -- EXISTE UM BOLETO PRA MAIS DE UMA NOTA, PRECISA INFORMAR O DOCUMENTO --
+   -------------------------------------------------------------------------
+   SELECT TOP 1 'É necessário informar o Documento na guia Contas a Pagar quando mais de uma nota tem o mesmo Boleto.'
+     FROM RECEBIMENTOS_LOJAS               A WITH(NOLOCK)
+     JOIN RECEBIMENTOS_LOJAS_BOLETOS       B WITH(NOLOCK) ON B.RECEBIMENTO_LOJA = A.RECEBIMENTO_LOJA
+     JOIN RECEBIMENTOS_LOJAS_TITULOS_PAGAR C WITH(NOLOCK) ON C.RECEBIMENTO_LOJA = A.RECEBIMENTO_LOJA
+                                                         AND C.DOCUMENTO        = 'FAVOR INFORMAR'
+    WHERE A.RECEBIMENTO_LOJA = @RECEBIMENTO_LOJA 
+
+   UNION ALL
+
+   --------------------------------
+   -- BOLETO SEM CODIGO DE BARRA --
+   --------------------------------
+   SELECT TOP 1 'F5 - BOLETOS - VALIDAR BOLETOS SEM CÓDIGOS DE BARRA.'
+	 FROM RECEBIMENTOS_LOJAS         A WITH(NOLOCK)
+	 JOIN RECEBIMENTOS_LOJAS_BOLETOS B WITH(NOLOCK) ON A.RECEBIMENTO_LOJA = B.RECEBIMENTO_LOJA
+    WHERE A.RECEBIMENTO_LOJA = @RECEBIMENTO_LOJA
+	  AND B.SEM_CODIGO_BARRAS = 'N'
+      AND B.BOLETO = ''
+   
+   UNION ALL
+   
+   --GEMADA 29/09/2024--
+   --SE O XML TEM CONTAS A PAGAR, O RECEBIMENTO TEM QUE TER TB
+   SELECT TOP 1 'Informar Guia de Contas a Pagar'
+     FROM RECEBIMENTOS_LOJAS                    A WITH(NOLOCK)
+     JOIN NFE_IDE                               B WITH(NOLOCK) ON B.ID = A.ID
+     JOIN NFE_DUP                               C WITH(NOLOCK) ON C.REGISTRO_NFE = B.REGISTRO_NFE
+     JOIN NFE_EMIT                              E WITH(NOLOCK) ON E.REGISTRO_NFE = B.REGISTRO_NFE
+LEFT JOIN RECEBIMENTOS_LOJAS_TITULOS_PAGAR	 D WITH(NOLOCK) ON D.RECEBIMENTO_LOJA = A.RECEBIMENTO_LOJA
+                                                           AND D.ENTIDADE         = E.ENTIDADE
+    WHERE 1 = 1
+      AND A.RECEBIMENTO_LOJA =@RECEBIMENTO_LOJA
+      AND D.RECEBIMENTO_LOJA IS NULL
+      AND @DB = 'SOFTFACIL_ATUAL'
+
+   UNION ALL
+   
+   --GEMADA 29/09/2024--
+   --SE O XML TEM CONTAS A PAGAR, O RECEBIMENTO TEM QUE TER TB
+   SELECT TOP 1 'Informar Guia de Contas a Pagar'
+     FROM RECEBIMENTOS_LOJAS_NFE                A WITH(NOLOCK)
+     JOIN NFE_IDE                               B WITH(NOLOCK) ON B.ID = A.ID_COMPLEMENTAR
+     JOIN NFE_DUP                               C WITH(NOLOCK) ON C.REGISTRO_NFE = B.REGISTRO_NFE
+     JOIN NFE_EMIT                              E WITH(NOLOCK) ON E.REGISTRO_NFE = B.REGISTRO_NFE
+LEFT JOIN RECEBIMENTOS_LOJAS_TITULOS_PAGAR	 D WITH(NOLOCK) ON D.RECEBIMENTO_LOJA = A.RECEBIMENTO_LOJA
+                                                           AND D.ENTIDADE         = E.ENTIDADE
+    WHERE 1 = 1
+      AND A.RECEBIMENTO_LOJA =@RECEBIMENTO_LOJA
+      AND D.RECEBIMENTO_LOJA IS NULL
+      AND @DB = 'SOFTFACIL_ATUAL'
+
+   UNION ALL
+
+   SELECT TOP 1 'Existem produtos com divergências de quantidade, clique no botão facilitador para processar as divergências'
+     FROM #TEMP_RECEBIMENTOS_DIVERGENCIAS A WITH(NOLOCK) 
+    WHERE A.RECEBIMENTO_LOJA = @RECEBIMENTO_LOJA
+      AND A.RECEBIMENTO_LOJA IS NOT NULL 
+   
+   -------------------------------
+   -- DIVERGENCIA NÃO INFORMADA --
+   -------------------------------
+   UNION ALL
+   
+   SELECT TOP 1 'TIPO DE DIVERGÊNCIAS NÃO INFORMADA'
+     FROM RECEBIMENTOS_LOJAS              A WITH(NOLOCK)
+     JOIN RECEBIMENTOS_LOJAS_DIVERGENCIAS B WITH(NOLOCK) ON A.RECEBIMENTO_LOJA = B.RECEBIMENTO_LOJA
+    WHERE A.RECEBIMENTO_LOJA = @RECEBIMENTO_LOJA
+      AND B.RECEBIMENTO_LOJA_DIVERGENCIA_TIPO IS NULL 
+   
+   --------------------------------------------------------
+   -- VALIDA SE O PEDIDO COMPRA EXISTE NO RECEB. CENTRAL --
+   --------------------------------------------------------
+   UNION ALL
+   
+   SELECT A.MENSAGEM
+     FROM ( SELECT CONCAT( 'NF-e: ', A.ID, ' possui inconsistência no Pedido de Compra!', CHAR(13)
+                         , 'Entre em contato com o setor de Cadastros ou Compras!') AS MENSAGEM
+              FROM RECEBIMENTOS_LOJAS           A WITH(NOLOCK)
+         LEFT JOIN RECEBIMENTOS_LOJAS_NFE       B WITH(NOLOCK) ON B.RECEBIMENTO_LOJA       = A.RECEBIMENTO_LOJA
+              JOIN RECEBIMENTOS_LOJAS_PEDIDOS   C WITH(NOLOCK) ON C.RECEBIMENTO_LOJA       = A.RECEBIMENTO_LOJA
+              JOIN RECEBIMENTOS_MERCADORIAS_NFE D WITH(NOLOCK) ON D.RECEBIMENTO_MERCADORIA = A.RECEBIMENTO_MERCADORIA
+                                                           AND D.ID                     = A.ID
+                                                           AND D.NUMERO_NFE             = C.NNF
+             WHERE A.RECEBIMENTO_LOJA = @RECEBIMENTO_LOJA
+               AND C.PEDIDO_COMPRA <> D.PEDIDO_COMPRA
+      
+            UNION ALL
+      
+            SELECT CONCAT( 'NF-e: ', B.ID_COMPLEMENTAR, ' possui inconsistência no Pedido de Compra!', CHAR(13)
+                         , 'Entre em contato com o setor de Cadastros ou Compras!') AS MENSAGEM
+              FROM RECEBIMENTOS_LOJAS           A WITH(NOLOCK)
+              JOIN RECEBIMENTOS_LOJAS_NFE       B WITH(NOLOCK) ON B.RECEBIMENTO_LOJA       = A.RECEBIMENTO_LOJA
+              JOIN RECEBIMENTOS_LOJAS_PEDIDOS   C WITH(NOLOCK) ON C.RECEBIMENTO_LOJA       = A.RECEBIMENTO_LOJA
+              JOIN RECEBIMENTOS_MERCADORIAS_NFE D WITH(NOLOCK) ON D.RECEBIMENTO_MERCADORIA = A.RECEBIMENTO_MERCADORIA
+                                                           AND D.ID                     = B.ID_COMPLEMENTAR
+                                                           AND D.NUMERO_NFE             = C.NNF
+             WHERE A.RECEBIMENTO_LOJA = @RECEBIMENTO_LOJA
+               AND C.PEDIDO_COMPRA <> D.PEDIDO_COMPRA
+          ) A
+
+   IF @FORCAR_VINCULO_PEDIDO_RECEBIMENTO = 'S' AND @PROCESSAR = 'S'
+   BEGIN  
+        -------------------------------
+        -- DIVERGENCIA NOTAS X PEDIDOS --
+        -------------------------------
+        IF OBJECT_ID('TEMPDB..#TEMP_RECEBIMENTO_NFE') IS NOT NULL DROP TABLE #TEMP_RECEBIMENTO_NFE
+        
+        CREATE
+         TABLE #TEMP_RECEBIMENTO_NFE    
+             ( QUANTIDADE NUMERIC(15))
+        
+        INSERT
+          INTO #TEMP_RECEBIMENTO_NFE
+             ( QUANTIDADE
+			 )
+        SELECT 1 + ISNULL(COUNT(B.RECEBIMENTO_LOJA),0) AS QUANTIDADE
+          FROM RECEBIMENTOS_LOJAS     A WITH(NOLOCK)
+     LEFT JOIN RECEBIMENTOS_LOJAS_NFE B WITH(NOLOCK) ON B.RECEBIMENTO_LOJA = A.RECEBIMENTO_LOJA
+         WHERE A.RECEBIMENTO_LOJA = @RECEBIMENTO_LOJA
+           AND @PROCESSAR = 'S'
+        
+        IF OBJECT_ID('TEMPDB..#TEMP_RECEBIMENTO_PEDIDO') IS NOT NULL DROP TABLE #TEMP_RECEBIMENTO_PEDIDO
+        
+        CREATE                                  
+         TABLE #TEMP_RECEBIMENTO_PEDIDO
+            (  QUANTIDADE NUMERIC(15) )
+        
+        INSERT
+          INTO #TEMP_RECEBIMENTO_PEDIDO
+             ( QUANTIDADE
+			 )
+        SELECT ISNULL(COUNT(B.RECEBIMENTO_LOJA),0) AS QUANTIDADE
+          FROM RECEBIMENTOS_LOJAS         A WITH(NOLOCK)
+     LEFT JOIN RECEBIMENTOS_LOJAS_PEDIDOS B WITH(NOLOCK) ON B.RECEBIMENTO_LOJA = A.RECEBIMENTO_LOJA
+         WHERE A.RECEBIMENTO_LOJA = @RECEBIMENTO_LOJA
+           AND @PROCESSAR = 'S'
+        
+        SELECT @MENSAGEM = CONCAT( 'Quantidade de Notas diferente da quantidade de Pedidos.', CHAR(13)
+                                 , 'Acione o botão "Gerar Pedidos"!')
+          FROM #TEMP_RECEBIMENTO_NFE    A
+          JOIN #TEMP_RECEBIMENTO_PEDIDO B ON 1=1
+         WHERE A.QUANTIDADE <> B.QUANTIDADE  
+         
+        SELECT @ID_TRANSF = A.REGISTRO_NFE
+          FROM NFE_IDE A WITH(NOLOCK)
+         WHERE A.ID = @ID
+           AND A.OPERACAO IN (4, 9) --BONIFICACAO | TRANSFERENCIA    
+  
+        IF @MENSAGEM IS NOT NULL AND @ID_TRANSF IS NULL
+        BEGIN
+             RAISERROR(@MENSAGEM, 16, 1)
+             RETURN
+        END
+   END
